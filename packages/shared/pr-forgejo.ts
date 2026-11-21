@@ -20,7 +20,18 @@
  * Runtime-agnostic: `fetch` only. Vendored to Pi.
  */
 
+import { FORGE_REF_BODY_MAX, FORGE_REF_COMMENT_MAX, type ForgeRefCardData, type ForgeRefChecks } from "@plannotator/core/forge-ref-card";
 import { getForgejoOrigin } from "./pr-types";
+import {
+  markedCommentText,
+  PRMarkedForbiddenError,
+  PRMarkedRaceError,
+  spliceMarkedSection,
+  startsWithMarker,
+  type PRMarkedCommentInput,
+  type PRMarkedResult,
+  type PRMarkedSectionInput,
+} from "./pr-marked";
 import type {
   ForgejoPRRef,
   PRContext,
@@ -117,9 +128,11 @@ async function failure(res: Response, what: string, ctx: FjContext): Promise<For
   }
   if (res.status === 403) {
     // An instance that requires sign-in answers every anonymous API call with 403 ("Only signed in user is
-    // allowed to call APIs"): with no token the fix is to add one, not to widen its scopes.
+    // allowed to call APIs"): with no token the fix is to add one, not to widen its scopes. It is a sign-in
+    // problem, so it is reported as one (401): a hover card then says to add a token, not that the repository
+    // is hidden.
     if (!ctx.token) {
-      return new ForgejoApiError(`Forgejo refused to ${what} (HTTP 403)${detail ? `: ${detail}` : ""}. ${missingTokenMessage(ctx.origin)}`, 403);
+      return new ForgejoApiError(`Forgejo refused to ${what} (HTTP 403)${detail ? `: ${detail}` : ""}. ${missingTokenMessage(ctx.origin)}`, 401);
     }
     return new ForgejoApiError(
       `Forgejo refused to ${what} (HTTP 403)${detail ? `: ${detail}` : ""}. ` +
@@ -241,6 +254,8 @@ interface FjPullRequest {
   draft?: boolean;
   mergeable?: boolean;
   changed_files?: number;
+  additions?: number;
+  deletions?: number;
   merge_base?: string;
   html_url?: string;
   user?: FjUser | null;
@@ -754,4 +769,204 @@ export async function fetchFjPRList(runtime: PRRuntime, ref: ForgejoPRRef): Prom
   } catch {
     return [];
   }
+}
+
+// --- Hover card ---
+
+interface FjIssue {
+  number: number;
+  title?: string;
+  body?: string;
+  state?: string;
+  comments?: number;
+  created_at?: string;
+  updated_at?: string;
+  closed_at?: string | null;
+  user?: FjUser | null;
+  labels?: Array<{ name?: string; color?: string }>;
+  assignees?: FjUser[] | null;
+  /** Present when the item is a pull request. */
+  pull_request?: { merged?: boolean; merged_at?: string | null; draft?: boolean } | null;
+}
+
+/** What names one issue or pull request for a card (Forgejo numbers them together). */
+export interface ForgejoCardRef {
+  host: string;
+  scheme?: "http";
+  owner: string;
+  repo: string;
+  number: number;
+}
+
+/** The latest decision of each reviewer, as a card shows it. */
+function cardReview(reviews: FjReview[] | null, requested: number): NonNullable<ForgeRefCardData["pull"]>["review"] {
+  if (reviews) {
+    const latest = new Map<string, string>();
+    for (const r of [...reviews].sort((a, b) => (a.submitted_at ?? "").localeCompare(b.submitted_at ?? ""))) {
+      const state = reviewState(r);
+      const who = userName(r.user);
+      if (state === "APPROVED" || state === "CHANGES_REQUESTED") latest.set(who, state);
+      else if (state === "DISMISSED") latest.delete(who);
+    }
+    const decisions = [...latest.values()];
+    if (decisions.includes("CHANGES_REQUESTED")) return "changes_requested";
+    if (decisions.includes("APPROVED")) return "approved";
+  }
+  return requested > 0 ? "review_required" : null;
+}
+
+/**
+ * One issue or pull request as a hover card shows it (`ref-cards.ts`). The issue read says which it is (a pull
+ * request carries `pull_request`); a pull request adds its branches and size, its reviews and its head's commit
+ * statuses, and the last comment is read for both (the extras are best effort: a card without them still shows).
+ * Throws `ForgejoApiError` (404: no such item, or the account cannot see it). `signal` aborts its requests.
+ * Avatars are left to the card's initials: an instance's avatar URL is not fetched.
+ */
+export async function fetchFjCard(runtime: PRRuntime, ref: ForgejoCardRef, signal?: AbortSignal): Promise<ForgeRefCardData> {
+  const fjRef: ForgejoPRRef = { platform: "forgejo", host: ref.host, ...(ref.scheme ? { scheme: ref.scheme } : {}), owner: ref.owner, repo: ref.repo, number: ref.number };
+  const base = context(runtime, fjRef);
+  signal?.throwIfAborted();
+  // Given up on (the hover cards' time limit): every request of this card stops with it.
+  const ctx: FjContext = signal ? { ...base, fetch: ((input, init) => base.fetch(input, { ...init, signal })) as typeof fetch } : base;
+  const repo = repoPath(fjRef);
+  const issue = await json<FjIssue>(ctx, `${repo}/issues/${ref.number}`, "fetch the issue");
+  const isPull = !!issue.pull_request;
+  const [pr, reviews, comments] = await Promise.all([
+    isPull ? json<FjPullRequest>(ctx, `${repo}/pulls/${ref.number}`, "fetch the pull request").catch(() => null) : null,
+    isPull ? paginate<FjReview>(ctx, `${repo}/pulls/${ref.number}/reviews`, "fetch PR reviews", 3).catch(() => null) : null,
+    (issue.comments ?? 0) > 0 ? json<FjIssueComment[]>(ctx, `${repo}/issues/${ref.number}/comments`, "fetch comments").catch(() => null) : null,
+  ]);
+  const statuses = pr?.head?.sha
+    ? await paginate<FjStatus>(ctx, `${repo}/commits/${encodeURIComponent(pr.head.sha)}/statuses`, "fetch PR statuses", 2).catch(() => null)
+    : null;
+
+  const merged = issue.pull_request?.merged === true || pr?.merged === true;
+  const closed = (issue.state ?? "").toLowerCase() === "closed";
+  const state: ForgeRefCardData["state"] = merged ? "merged" : closed ? "closed" : isPull && (issue.pull_request?.draft === true || pr?.draft === true) ? "draft" : "open";
+
+  let checks: ForgeRefChecks | null = null;
+  if (statuses && statuses.length > 0) {
+    let passed = 0;
+    let failed = 0;
+    let pending = 0;
+    for (const status of statuses) {
+      const s = (status.status ?? "").toLowerCase();
+      if (s === "success") passed++;
+      else if (s === "failure" || s === "error") failed++;
+      else if (s === "pending") pending++;
+    }
+    // A state this code does not know (warning, skipped) counts for nothing, so it never reads as passed.
+    const total = passed + failed + pending;
+    if (total > 0) checks = { state: failed > 0 ? "failure" : pending > 0 ? "pending" : "success", passed, failed, pending, total };
+  }
+
+  const person = (u: FjUser | null | undefined) => (u && userName(u) ? { login: userName(u), avatarUrl: null } : null);
+  const last = comments && comments.length > 0 ? comments[comments.length - 1]! : null;
+  const body = issue.body ?? "";
+  const origin = getForgejoOrigin(fjRef);
+  return {
+    platform: "forgejo",
+    kind: isPull ? "pull" : "issue",
+    repo: `${ref.owner}/${ref.repo}`,
+    number: ref.number,
+    url: `${origin}/${ref.owner}/${ref.repo}/${isPull ? "pulls" : "issues"}/${ref.number}`,
+    title: issue.title ?? "",
+    state,
+    author: person(issue.user),
+    createdAt: issue.created_at ?? "",
+    updatedAt: issue.updated_at ?? "",
+    closedAt: merged ? (issue.pull_request?.merged_at ?? issue.closed_at ?? null) : (issue.closed_at ?? null),
+    labels: (issue.labels ?? []).map((l) => ({ name: l.name ?? "", color: (l.color ?? "").replace(/^#/, "") })).filter((l) => l.name),
+    assignees: (issue.assignees ?? []).flatMap((u) => person(u) ?? []),
+    comments: issue.comments ?? 0,
+    body: body.slice(0, FORGE_REF_BODY_MAX),
+    bodyCut: body.length > FORGE_REF_BODY_MAX,
+    lastComment: last
+      ? { author: person(last.user), at: last.created_at ?? "", body: (last.body ?? "").slice(0, FORGE_REF_COMMENT_MAX) }
+      : null,
+    linked: [],
+    ...(isPull
+      ? {
+          pull: {
+            base: pr?.base?.ref ?? "",
+            // Once its branch is deleted a closed pull request's head is Forgejo's own ref, not a branch name.
+            head: /^refs\/pull\//.test(pr?.head?.ref ?? "") ? "(branch deleted)" : (pr?.head?.ref ?? ""),
+            additions: pr?.additions ?? 0,
+            deletions: pr?.deletions ?? 0,
+            files: pr?.changed_files ?? 0,
+            review: cardReview(reviews, pr?.requested_reviewers?.length ?? 0),
+            checks,
+          },
+        }
+      : {}),
+  };
+}
+
+// --- Marked text (the Inbox's Post decisions) ---
+
+/**
+ * The most characters one Forgejo comment or description is given. Forgejo documents no limit for either; this is
+ * GitHub's, so a text that fits here fits anywhere, and a longer one takes the comment-instead / "too long" path.
+ * Unverified against a real instance's own cap.
+ */
+export const FJ_BODY_MAX = 65_535;
+
+/** The comment's own page: Forgejo's `html_url`, else the pull request's with the comment's anchor. */
+function commentUrl(ref: ForgejoPRRef, comment: { id?: number; html_url?: string }): string {
+  return comment.html_url || (typeof comment.id === "number" ? `${webUrl(ref)}#issuecomment-${comment.id}` : webUrl(ref));
+}
+
+/**
+ * Post the person's marked comment on a pull request, or edit it in place: the comment of the token's own account
+ * whose body starts with the marker (someone else's with the same marker is never touched), else a new one. A
+ * comment deleted since is posted again.
+ */
+export async function upsertFjMarkedComment(runtime: PRRuntime, ref: ForgejoPRRef, input: PRMarkedCommentInput): Promise<PRMarkedResult> {
+  const ctx = context(runtime, ref);
+  const text = markedCommentText(input, FJ_BODY_MAX);
+  const issue = `${repoPath(ref)}/issues`;
+  const comments = await paginate<FjIssueComment>(ctx, `${issue}/${ref.number}/comments`, "read the pull request's comments");
+  const marked = comments.filter((comment) => startsWithMarker(comment.body, input.marker));
+  const me = marked.length > 0 ? await getFjUser(runtime, ref) : null;
+  const existing = marked.filter((comment) => me !== null && userName(comment.user).toLowerCase() === me.toLowerCase()).at(-1);
+  if (existing) {
+    const edited = await request(ctx, `${issue}/comments/${existing.id}`, { method: "PATCH", body: { body: text } });
+    if (edited.ok) return { action: "updated", url: commentUrl(ref, existing) };
+    // Gone since it was listed: post it again below. Anything else is the person's to see.
+    if (edited.status !== 404) throw await failure(edited, "update the comment", ctx);
+  }
+  const posted = await request(ctx, `${issue}/${ref.number}/comments`, { method: "POST", body: { body: text } });
+  if (!posted.ok) throw await failure(posted, "post the comment", ctx);
+  let made: FjIssueComment | null = null;
+  try {
+    made = (await posted.json()) as FjIssueComment;
+  } catch {
+    // The comment went; its link is the pull request's.
+  }
+  return { action: "created", url: made ? commentUrl(ref, made) : webUrl(ref) };
+}
+
+/**
+ * Put a marked section in the pull request's description (or replace the one there), every byte outside it kept. The
+ * description is read twice: one that changed in between is not written over. A refusal for access (not its author,
+ * no write access) is `PRMarkedForbiddenError`, so the caller can post a comment instead.
+ */
+export async function upsertFjDescriptionSection(runtime: PRRuntime, ref: ForgejoPRRef, input: PRMarkedSectionInput): Promise<PRMarkedResult> {
+  const ctx = context(runtime, ref);
+  const path = `${repoPath(ref)}/pulls/${ref.number}`;
+  const read = async (): Promise<{ body: string; url: string }> => {
+    const pr = await json<FjPullRequest>(ctx, path, "read the pull request");
+    return { body: pr.body ?? "", url: pr.html_url || webUrl(ref) };
+  };
+  const first = await read();
+  const planned = spliceMarkedSection(first.body, input, FJ_BODY_MAX);
+  if ((await read()).body !== first.body) throw new PRMarkedRaceError();
+  const written = await request(ctx, path, { method: "PATCH", body: { body: planned.text } });
+  if (!written.ok) {
+    const error = await failure(written, "edit the description", ctx);
+    // The same account just read it, so a 403 or a 404 on the write is "you may not edit this".
+    if (error.status === 403 || error.status === 404) throw new PRMarkedForbiddenError(error.message);
+    throw error;
+  }
+  return { action: planned.replaced ? "updated" : "created", url: first.url };
 }
